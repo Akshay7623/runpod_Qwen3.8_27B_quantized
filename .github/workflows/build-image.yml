@@ -1,0 +1,105 @@
+# Builds the worker image on GitHub's runners and pushes it to GHCR as
+# ghcr.io/akshay7623/runpod_qwen3.8_27b_nvfp4, tagged `latest` and `sha-<commit>`.
+# RunPod's endpoint then pulls it from there, so this does not depend on
+# RunPod's own GitHub build.
+name: Build image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - handler.py
+      - test_input.json
+      - src/**
+      - .github/workflows/build-image.yml
+  workflow_dispatch:
+
+# A newer push replaces a build that is still running.
+concurrency:
+  group: build-image
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/akshay7623/runpod_qwen3.8_27b_nvfp4
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+
+      # The build needs about 65 GB: the 23 GB base image, the weights in the
+      # download stage, and the same weights again in the final image. That is
+      # more than the runner has free. Remove preinstalled tools, then join the
+      # free space on / and /mnt into one volume and give it to Docker.
+      - name: Make room for the image
+        run: |
+          set -euxo pipefail
+          df -h
+          sudo systemctl stop docker.socket docker
+          sudo swapoff -a || true
+          sudo rm -rf /mnt/swapfile /swapfile /var/lib/docker \
+            /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache /usr/local/share/boost /usr/local/share/powershell \
+            /usr/share/swift /usr/lib/jvm /opt/microsoft /opt/google /opt/az
+          command -v pvcreate >/dev/null || sudo apt-get install -y -qq lvm2
+
+          gib=$((1024 * 1024 * 1024))
+          # Leave 4 GB on / for the runner itself.
+          sudo fallocate -l $(( $(df --output=avail -B1 / | tail -1) - 4 * gib )) /docker-root.img
+          devices=("$(sudo losetup --find --show /docker-root.img)")
+          if mountpoint -q /mnt; then
+            sudo fallocate -l $(( $(df --output=avail -B1 /mnt | tail -1) - gib )) /mnt/docker-mnt.img
+            devices+=("$(sudo losetup --find --show /mnt/docker-mnt.img)")
+          fi
+          sudo pvcreate -qq "${devices[@]}"
+          sudo vgcreate -qq build "${devices[@]}"
+          sudo lvcreate -qq -y -l 100%FREE -n docker build
+          sudo mkfs.ext4 -q -m 0 /dev/build/docker
+          sudo mkdir -p /var/lib/docker
+          sudo mount /dev/build/docker /var/lib/docker
+
+          # Docker's classic image store keeps one copy of each layer; the
+          # containerd store would also keep a compressed copy, on another disk.
+          { sudo cat /etc/docker/daemon.json 2>/dev/null || true; } \
+            | jq -s '(.[0] // {}) | .features["containerd-snapshotter"] = false' \
+            | sudo tee /etc/docker/daemon.json.new >/dev/null
+          sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          sudo systemctl start docker
+          test "$(docker info -f '{{.Driver}}')" = overlay2
+          df -h / /var/lib/docker
+
+      - name: Log in to GHCR
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build
+        run: |
+          docker build --progress=plain \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            -t "$IMAGE:sha-${GITHUB_SHA::7}" -t "$IMAGE:latest" .
+          docker image ls "$IMAGE"
+          df -h /var/lib/docker
+
+      - name: Push
+        run: docker push --all-tags "$IMAGE"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image pushed"
+            echo
+            echo "Use this in the RunPod endpoint:"
+            echo
+            echo '```'
+            echo "$IMAGE:sha-${GITHUB_SHA::7}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,4 @@
+# These files are read inside the Linux container; CRLF endings break them.
+*.sh text eol=lf
+Dockerfile text eol=lf
+src/sha256sums.txt text eol=lf

@@ -1,0 +1,8 @@
+.git
+.gitignore
+.gitattributes
+.env
+__pycache__
+*.md
+LICENSE
+sample-req-*.json
